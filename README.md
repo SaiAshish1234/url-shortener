@@ -11,7 +11,7 @@ A production-grade URL shortener built on AWS serverless infrastructure with ful
 ## Tech Stack
 
 | Layer | Technology |
-|-------|-----------|
+|-------|------------|
 | Compute | AWS Lambda (Python 3.12) |
 | Database | AWS DynamoDB (on-demand) |
 | API | AWS API Gateway (HTTP API) |
@@ -24,13 +24,17 @@ A production-grade URL shortener built on AWS serverless infrastructure with ful
 ---
 
 ## Architecture
+
+```
 User → CloudFront CDN → API Gateway → Lambda → DynamoDB
-↓
-S3 (Frontend)
+                              ↓
+                        S3 (Frontend)
+```
+
 1. User visits the site via CloudFront
 2. Pastes a long URL and clicks Shorten
 3. Lambda generates a 6-character code and stores it in DynamoDB
-4. User shares the short link — clicking it hits Lambda which looks up the code and redirects
+4. Clicking the short link hits Lambda which redirects to the original URL
 
 ---
 
@@ -40,29 +44,33 @@ S3 (Frontend)
 - ↩️ 301 redirects with click tracking
 - ⏰ Automatic link expiry via DynamoDB TTL
 - 🌍 Global CDN via CloudFront
-- 📊 CloudWatch dashboard with request/error/latency metrics
+- 📊 CloudWatch dashboard with metrics
 - 🚨 SNS email alerts on error spikes
-- ✅ 14 automated tests with 95% code coverage
-- 🔄 Full CI/CD — every push auto-deploys to production
+- ✅ 14 automated tests with 95% coverage
+- 🔄 Full CI/CD — every push auto-deploys
 
 ---
 
 ## Project Structure
+
+```
 url-shortener/
 ├── src/
-│   └── handler.py          # Lambda function
+│   └── handler.py              # Lambda function (Python 3.12)
 ├── tests/
-│   └── test_handler.py     # pytest tests (moto mocks)
+│   └── test_handler.py         # pytest tests with moto mocks
 ├── frontend/
-│   └── index.html          # Static frontend
+│   └── index.html              # Static frontend (deployed to S3)
 ├── infra/
-│   ├── main.tf             # All AWS resources
+│   ├── main.tf                 # All AWS resources in Terraform
 │   ├── variables.tf
 │   └── outputs.tf
 ├── .github/workflows/
-│   └── deploy.yml          # CI/CD pipeline
+│   └── deploy.yml              # GitHub Actions CI/CD pipeline
 └── scripts/
-└── bootstrap.sh        # One-time AWS setup
+    └── bootstrap.sh            # One-time AWS account setup
+```
+
 ---
 
 ## CI/CD Pipeline
@@ -72,21 +80,14 @@ url-shortener/
 | Push to any branch | Run tests + lint |
 | Merge to main | Deploy to production |
 
-Pipeline steps:
-1. Install dependencies
-2. Lint with flake8
-3. Run 14 pytest tests
-4. Package Lambda as zip
-5. Terraform apply
-6. Sync frontend to S3
-7. Invalidate CloudFront cache
-8. Smoke test production
+Pipeline steps: lint → test → build Lambda zip → terraform apply → S3 sync → CloudFront invalidation → smoke test
 
 ---
 
 ## API Reference
 
-### POST /shorten
+**POST /shorten**
+
 ```bash
 curl -X POST https://85yw1disj9.execute-api.us-east-1.amazonaws.com/shorten \
   -H "Content-Type: application/json" \
@@ -94,6 +95,7 @@ curl -X POST https://85yw1disj9.execute-api.us-east-1.amazonaws.com/shorten \
 ```
 
 Response:
+
 ```json
 {
   "short_url": "https://d1wahrswrbzjbf.cloudfront.net/aB3kR9",
@@ -102,8 +104,7 @@ Response:
 }
 ```
 
-### GET /{code}
-Redirects to the original URL with a 301 status code.
+**GET /{code}** — 301 redirect to the original URL
 
 ---
 
