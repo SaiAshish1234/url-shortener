@@ -212,10 +212,3 @@ jobs:
           STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L --max-redirs 0 "$API/$CODE" || true)
           echo "Redirect status: $STATUS"
           [ "$STATUS" = "301" ] && echo "✅ Smoke test passed" || (echo "❌ Redirect failed"; exit 1)
-
-      - name: Tag release
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "deploy-$(date +%Y%m%d-%H%M%S)" -m "Production deployment"
-          git push --tags
