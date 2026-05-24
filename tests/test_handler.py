@@ -1,6 +1,5 @@
 import json
 import os
-import time
 import pytest
 import boto3
 from moto import mock_aws
@@ -129,7 +128,10 @@ class TestRedirect:
         code = self._shorten("https://example.com")
         for _ in range(3):
             lambda_handler(make_event("GET", f"/{code}"), {})
-        item = boto3.resource("dynamodb", region_name="us-east-1").Table("test-urls").get_item(Key={"code": code})["Item"]
+        table = boto3.resource(
+            "dynamodb", region_name="us-east-1"
+        ).Table("test-urls")
+        item = table.get_item(Key={"code": code})["Item"]
         assert int(item["hits"]) == 3
 
 
