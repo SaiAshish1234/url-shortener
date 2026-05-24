@@ -1,0 +1,221 @@
+name: CI/CD — URL Shortener
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.7.5"
+  PYTHON_VERSION: "3.12"
+
+# Prevent concurrent deployments to the same environment
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. Test ─────────────────────────────────────────────────────────────────
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (flake8)
+        run: flake8 src/ tests/ --max-line-length=100
+
+      - name: Run tests with coverage
+        run: pytest --cov=src --cov-report=xml --cov-fail-under=80
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+        continue-on-error: true   # Don't fail if Codecov is unavailable
+
+  # ── 2. Build Lambda zip ──────────────────────────────────────────────────────
+  build:
+    name: Build Lambda Package
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Package Lambda
+        run: |
+          cd src
+          pip install -r requirements.txt -t .
+          zip -r ../lambda.zip . -x "*.pyc" -x "__pycache__/*"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-zip
+          path: lambda.zip
+          retention-days: 7
+
+  # ── 3. Deploy to Staging (on PR to main) ────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    needs: build
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ steps.tf-output.outputs.cloudfront_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lambda-zip
+          path: infra/
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: infra/
+        run: terraform init
+
+      - name: Terraform Apply (staging)
+        working-directory: infra/
+        run: |
+          terraform apply -auto-approve \
+            -var="env=staging" \
+            -var="alert_email=${{ secrets.ALERT_EMAIL }}"
+
+      - name: Capture outputs
+        id: tf-output
+        working-directory: infra/
+        run: |
+          echo "cloudfront_url=$(terraform output -raw cloudfront_url)" >> $GITHUB_OUTPUT
+          echo "frontend_bucket=$(terraform output -raw frontend_bucket)" >> $GITHUB_OUTPUT
+          echo "cf_dist_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+
+      - name: Deploy frontend to S3
+        run: |
+          aws s3 sync frontend/ s3://${{ steps.tf-output.outputs.frontend_bucket }} \
+            --delete --cache-control "public,max-age=3600"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.tf-output.outputs.cf_dist_id }} \
+            --paths "/*"
+
+      - name: Smoke test staging
+        run: |
+          API=$(cd infra && terraform output -raw api_endpoint)
+          echo "Testing POST /shorten..."
+          RESPONSE=$(curl -sf -X POST "$API/shorten" \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://example.com"}')
+          echo "$RESPONSE"
+          echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'short_url' in d, 'Missing short_url'"
+          echo "✅ Smoke test passed"
+
+  # ── 4. Deploy to Production (on merge to main) ───────────────────────────────
+  deploy-prod:
+    name: Deploy → Production
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.tf-output.outputs.cloudfront_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lambda-zip
+          path: infra/
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: infra/
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: infra/
+        run: |
+          terraform plan \
+            -var="env=prod" \
+            -var="alert_email=${{ secrets.ALERT_EMAIL }}" \
+            -out=tfplan
+
+      - name: Terraform Apply (prod)
+        working-directory: infra/
+        run: terraform apply tfplan
+
+      - name: Capture outputs
+        id: tf-output
+        working-directory: infra/
+        run: |
+          echo "cloudfront_url=$(terraform output -raw cloudfront_url)" >> $GITHUB_OUTPUT
+          echo "frontend_bucket=$(terraform output -raw frontend_bucket)" >> $GITHUB_OUTPUT
+          echo "cf_dist_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+
+      - name: Deploy frontend to S3
+        run: |
+          aws s3 sync frontend/ s3://${{ steps.tf-output.outputs.frontend_bucket }} \
+            --delete --cache-control "public,max-age=86400"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.tf-output.outputs.cf_dist_id }} \
+            --paths "/*"
+
+      - name: Smoke test production
+        run: |
+          API=$(cd infra && terraform output -raw api_endpoint)
+          echo "Testing POST /shorten..."
+          RESPONSE=$(curl -sf -X POST "$API/shorten" \
+            -H "Content-Type: application/json" \
+            -d '{"url":"https://example.com"}')
+          echo "$RESPONSE"
+          echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'short_url' in d"
+          CODE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['code'])")
+          echo "Testing GET redirect for code: $CODE..."
+          STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L --max-redirs 0 "$API/$CODE" || true)
+          echo "Redirect status: $STATUS"
+          [ "$STATUS" = "301" ] && echo "✅ Smoke test passed" || (echo "❌ Redirect failed"; exit 1)
+
+      - name: Tag release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "deploy-$(date +%Y%m%d-%H%M%S)" -m "Production deployment"
+          git push --tags
